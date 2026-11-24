@@ -1,0 +1,10 @@
+.DS_Store
+.claude/
+.idea/
+*.log
+log.log
+node_modules/
+.env
+.env.*
+dist/
+*.local
