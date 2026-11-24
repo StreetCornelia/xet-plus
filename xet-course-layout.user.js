@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         小鹅通课程页布局重构
 // @namespace    https://github.com/StreetCornelia/xet-plus
-// @version      0.3.11
-// @description  重构课程页：16:9 播放器、全屏按钮、播放参数记忆、课程选集面板
+// @version      0.3.12
+// @description  重构课程页：16:9 播放器、全屏按钮、播放参数记忆、课程选集面板、无刷新切课
 // @author       Dash
 // @match        https://*.pc.xiaoe-tech.com/p/t_pc/course_pc_detail/video/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=xiaoeknow.com
@@ -18,7 +18,7 @@
   'use strict';
 
   const STYLE_ID = 'xet-layout-style';
-  const STYLE_VERSION = '0.3.11';
+  const STYLE_VERSION = '0.3.12';
   const PREFS_KEY = 'xet-playback-prefs-v1';
   const CATALOG_API = '/xe.course.business_go.avoidlogin.e_course.resource_catalog_list.get/1.0.0';
   const SUB_CATALOG_API = '/xe.course.business_go.avoidlogin.e_course.sub.course.list/1.0.0';
@@ -88,6 +88,10 @@
   let chapterStateCourseId = '';
   let hoverOpenTimer = 0;
   let hoverCloseTimer = 0;
+  let seamlessSwitching = false;
+  let activeLessonPath = location.pathname;
+  const originalJumpTargetUrl = new WeakMap();
+  const originalChangeNextVideoEvent = new WeakMap();
 
   function isPlaybackPage() {
     return /\/course_pc_detail\/video\/[^/]*v_[A-Za-z0-9]+/.test(location.pathname);
@@ -918,6 +922,241 @@
   function getCurrentResourceId() {
     const match = location.pathname.match(/\/course_pc_detail\/video\/(v_[A-Za-z0-9]+)/);
     return match ? match[1] : '';
+  }
+
+  function isVideoLessonUrl(url) {
+    try {
+      const parsed = new URL(url, location.origin);
+      return (
+        parsed.origin === location.origin &&
+        /\/p\/t_pc\/course_pc_detail\/video\/v_[A-Za-z0-9]+/.test(parsed.pathname)
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function waitForCondition(predicate, timeout = 15000) {
+    return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      const check = () => {
+        let value = null;
+        try {
+          value = predicate();
+        } catch (_) {}
+        if (value) {
+          resolve(value);
+          return;
+        }
+        if (Date.now() - startedAt >= timeout) {
+          reject(new Error('等待播放器初始化超时'));
+          return;
+        }
+        requestAnimationFrame(check);
+      };
+      check();
+    });
+  }
+
+  function invalidateVueComputed(component) {
+    Object.values(component?._computedWatchers || {}).forEach((watcher) => {
+      watcher.dirty = true;
+    });
+  }
+
+  function resetPlayerState(playerVm) {
+    playerVm.captionList = [];
+    playerVm.routeListObj = {};
+    playerVm.hasRouteList = false;
+    playerVm.storageRoute = '';
+    playerVm.playTime = 0;
+    playerVm.isFirstReport = true;
+    playerVm.videoUrls = [];
+    playerVm.loopVideoForPackage = null;
+  }
+
+  async function refreshVideoPlayer(target, updateRoute) {
+    const baseVm = document.querySelector('.course_base_layout')?.__vue__;
+    const playerVm = document.querySelector('.video-content-header')?.__vue__;
+    const router = baseVm?.$router;
+
+    if (
+      !baseVm ||
+      !playerVm ||
+      !router ||
+      typeof baseVm.initCourseCoreData !== 'function' ||
+      typeof playerVm.initVideo !== 'function'
+    ) {
+      throw new Error('未找到站点播放器局部刷新接口');
+    }
+
+    try {
+      playerVm.player?.pause?.();
+      playerVm.player?.destroy?.();
+    } catch (_) {}
+    playerVm.player = null;
+
+    if (updateRoute) {
+      const route = `${target.pathname}${target.search}${target.hash}`;
+      const navigation = router.push(route);
+      if (navigation && typeof navigation.then === 'function') await navigation;
+    }
+
+    invalidateVueComputed(baseVm);
+    invalidateVueComputed(playerVm);
+    await baseVm.initCourseCoreData();
+    invalidateVueComputed(baseVm);
+    invalidateVueComputed(playerVm);
+
+    resetPlayerState(playerVm);
+    if (typeof playerVm.getVideoExchangeRouteList === 'function') {
+      await playerVm.getVideoExchangeRouteList();
+    }
+    if (typeof playerVm.initCaptionsList === 'function') {
+      await playerVm.initCaptionsList();
+    }
+    playerVm.initQuizz?.();
+    playerVm.initVideo();
+
+    const targetId = target.pathname.split('/').pop();
+    await waitForCondition(
+      () =>
+        playerVm.player &&
+        playerVm.resourceId === targetId &&
+        document.querySelector('#pc_course_fe_basic_video video')
+    );
+  }
+
+  async function switchLessonSeamlessly(url) {
+    if (!isVideoLessonUrl(url)) {
+      location.assign(url);
+      return;
+    }
+    if (seamlessSwitching) return;
+
+    const target = new URL(url, location.origin);
+    if (target.href === location.href) return;
+    seamlessSwitching = true;
+    closePlaylist();
+    try {
+      await refreshVideoPlayer(target, true);
+      activeLessonPath = target.pathname;
+      updatePlaylistCurrent();
+      armApply();
+      scheduleUpdate();
+      requestResize();
+    } catch (error) {
+      console.warn('[xet] 无刷新切课失败，已回退到整页跳转。', error);
+      location.assign(target.href);
+    } finally {
+      seamlessSwitching = false;
+    }
+  }
+
+  function onHistoryLessonSwitch() {
+    requestAnimationFrame(async () => {
+      if (!isPlaybackPage() || seamlessSwitching) return;
+      if (location.pathname === activeLessonPath) return;
+      if (!isVideoLessonUrl(location.href)) {
+        activeLessonPath = location.pathname;
+        return;
+      }
+
+      const target = new URL(location.href);
+      seamlessSwitching = true;
+      try {
+        await refreshVideoPlayer(target, false);
+        activeLessonPath = target.pathname;
+        updatePlaylistCurrent();
+        armApply();
+        scheduleUpdate();
+        requestResize();
+      } catch (error) {
+        console.warn('[xet] 浏览器前进/后退切课失败，已刷新页面。', error);
+        location.reload();
+      } finally {
+        seamlessSwitching = false;
+      }
+    });
+  }
+
+  function videoTargetToUrl(target) {
+    const raw = typeof target === 'string' ? target : target?.url || target?.jump_url || '';
+    if (!raw) return '';
+    let parsed;
+    try {
+      parsed = new URL(raw, location.origin);
+    } catch (_) {
+      return '';
+    }
+    if (parsed.origin !== location.origin) return '';
+    if (isVideoLessonUrl(parsed.href)) {
+      return parsed.pathname.split('/').pop() === getCurrentResourceId() ? '' : parsed.href;
+    }
+    const rid = parsed.pathname.match(/\/p\/course\/video\/([^/?#]+)/)?.[1];
+    return rid && rid !== getCurrentResourceId() ? sectionUrl({ rid, type: 3 }) : '';
+  }
+
+  function patchNativeNextNavigation() {
+    const playerVm = document.querySelector('.video-content-header')?.__vue__;
+    if (!playerVm) return;
+
+    const funcTool = playerVm.$funcTool;
+    if (
+      funcTool &&
+      typeof funcTool.jumpTargetUrl === 'function' &&
+      !funcTool.jumpTargetUrl.__xetPatched
+    ) {
+      if (!originalJumpTargetUrl.has(funcTool)) {
+        originalJumpTargetUrl.set(funcTool, funcTool.jumpTargetUrl);
+      }
+      const original = originalJumpTargetUrl.get(funcTool);
+      const patched = function (target, ...args) {
+        try {
+          const url = videoTargetToUrl(target);
+          if (url) {
+            switchLessonSeamlessly(url);
+            return;
+          }
+        } catch (_) {}
+        return original.call(this, target, ...args);
+      };
+      patched.__xetPatched = true;
+      try {
+        funcTool.jumpTargetUrl = patched;
+      } catch (_) {}
+    }
+
+    if (
+      typeof playerVm.changeNextVideoEvent === 'function' &&
+      !playerVm.changeNextVideoEvent.__xetPatched
+    ) {
+      if (!originalChangeNextVideoEvent.has(playerVm)) {
+        originalChangeNextVideoEvent.set(playerVm, playerVm.changeNextVideoEvent);
+      }
+      const original = originalChangeNextVideoEvent.get(playerVm);
+      const patched = async function (...args) {
+        try {
+          if (
+            this.isPrdPackage &&
+            !this.loopVideoForPackage?.next &&
+            typeof this.initLoop === 'function'
+          ) {
+            await this.initLoop();
+          }
+          const url = videoTargetToUrl(this.loopVideoForPackage?.next);
+          if (url) {
+            switchLessonSeamlessly(url);
+            return;
+          }
+        } catch (_) {}
+        return original.apply(this, args);
+      };
+      patched.__xetPatched = true;
+      try {
+        playerVm.changeNextVideoEvent = patched;
+      } catch (_) {}
+    }
   }
 
   function normalizeSection(section) {
@@ -1880,7 +2119,12 @@
       return;
     }
 
-    playlistOpen = false;
+    if (isVideoLessonUrl(url)) {
+      switchLessonSeamlessly(url);
+      return;
+    }
+
+    closePlaylist();
     location.assign(url);
   }
 
@@ -2008,6 +2252,7 @@
     watchVideo();
     watchTitle();
     watchDocumentTitle();
+    patchNativeNextNavigation();
     ensurePlaylistControl();
     updatePlaylistCurrent();
     if (playlistOpen) ensurePlaylistPanel();
@@ -2104,6 +2349,7 @@
       armApply();
       updatePlaylistCurrent();
     });
+    window.addEventListener('popstate', onHistoryLessonSwitch);
   }
 
   function clickSiteControl(selector) {
