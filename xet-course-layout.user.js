@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         小鹅通课程页布局重构
 // @namespace    https://github.com/StreetCornelia/xet-plus
-// @version      0.3.12
-// @description  重构课程页：16:9 播放器、全屏按钮、播放参数记忆、课程选集面板、无刷新切课
+// @version      0.3.14
+// @description  重构课程页：16:9 播放器、默认网页宽屏、播放参数记忆、多系列选集 tab、无刷新切课
 // @author       Dash
 // @match        https://*.pc.xiaoe-tech.com/p/t_pc/course_pc_detail/video/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=xiaoeknow.com
@@ -18,7 +18,7 @@
   'use strict';
 
   const STYLE_ID = 'xet-layout-style';
-  const STYLE_VERSION = '0.3.12';
+  const STYLE_VERSION = '0.3.14';
   const PREFS_KEY = 'xet-playback-prefs-v1';
   const CATALOG_API = '/xe.course.business_go.avoidlogin.e_course.resource_catalog_list.get/1.0.0';
   const SUB_CATALOG_API = '/xe.course.business_go.avoidlogin.e_course.sub.course.list/1.0.0';
@@ -41,6 +41,9 @@
   let stateBeforeNative = null;
   let lastWide = false;
   let lastNative = false;
+  let initialWideDone = false;
+  let wideRetryTimer = 0;
+  let wideRetryCount = 0;
   let observedRoot = null;
   let resizeObserver = null;
   let observedPlayerBox = null;
@@ -82,6 +85,7 @@
   let playlistRestoreScroll = false;
   let playlistActiveRid = '';
   let playlistCurrentChapterId = '';
+  let playlistSeriesIndex = -1;
   let playlistPrefetchTimer = 0;
   let catalogPrefetchDone = false;
   let chapterOverrides = new Map();
@@ -439,6 +443,52 @@
         border-color: #4aa8ff;
       }
 
+      body.xet-rebuild .xet-playlist-panel.has-series {
+        min-width: 320px;
+      }
+
+      body.xet-rebuild .xet-pl-series-tabs {
+        display: flex;
+        flex: 0 0 auto;
+        gap: 4px;
+        padding: 0 12px 8px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: none;
+      }
+
+      body.xet-rebuild .xet-pl-series-tabs::-webkit-scrollbar {
+        display: none;
+      }
+
+      body.xet-rebuild .xet-pl-series-tab {
+        flex: 0 0 auto;
+        max-width: 220px;
+        padding: 5px 10px;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        background: rgba(255, 255, 255, 0.055);
+        color: rgba(255, 255, 255, 0.62);
+        font-family: inherit;
+        font-size: 12px;
+        line-height: 1.35;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        cursor: pointer;
+      }
+
+      body.xet-rebuild .xet-pl-series-tab:hover {
+        background: rgba(255, 255, 255, 0.09);
+        color: #fff;
+      }
+
+      body.xet-rebuild .xet-pl-series-tab.active {
+        border-color: rgba(74, 168, 255, 0.46);
+        background: rgba(74, 168, 255, 0.17);
+        color: #fff;
+      }
+
       body.xet-rebuild .xet-pl-body {
         position: relative;
         flex: 1 1 auto;
@@ -499,6 +549,7 @@
         flex: 0 0 auto;
         font-size: 11px;
         color: rgba(255, 255, 255, 0.4);
+        white-space: nowrap;
       }
 
       body.xet-rebuild .xet-pl-chevron {
@@ -990,6 +1041,8 @@
       throw new Error('未找到站点播放器局部刷新接口');
     }
 
+    const wasWide = isWebFullscreen();
+
     try {
       playerVm.player?.pause?.();
       playerVm.player?.destroy?.();
@@ -1025,6 +1078,8 @@
         playerVm.resourceId === targetId &&
         document.querySelector('#pc_course_fe_basic_video video')
     );
+
+    if (wasWide && !isWebFullscreen()) enterWebFullscreenWhenReady();
   }
 
   async function switchLessonSeamlessly(url) {
@@ -1193,7 +1248,7 @@
       const byId = new Map();
 
       for (const entry of series) {
-        const group = { label: entry.title || '未命名系列', chapters: [] };
+        const group = { label: entry.title || '未命名系列', chapters: [], series: true };
         byId.set(entry.id, group);
         groups.push(group);
       }
@@ -1207,7 +1262,7 @@
 
         if (!group) {
           if (!fallback) {
-            fallback = { label: '', chapters: [] };
+            fallback = { label: '未分组', chapters: [], series: true };
             groups.push(fallback);
           }
           group = fallback;
@@ -1238,7 +1293,7 @@
     }
 
     const groups = [];
-    let group = { label: '', chapters: [] };
+    let group = { label: '', chapters: [], series: false };
     groups.push(group);
 
     for (const item of top) {
@@ -1246,7 +1301,7 @@
       const type = Number(item.resource_type) || 0;
 
       if (type === 0 && !sectionNum) {
-        group = { label: String(item.chapter_title || '').trim(), chapters: [] };
+        group = { label: String(item.chapter_title || '').trim(), chapters: [], series: false };
         groups.push(group);
         continue;
       }
@@ -1341,7 +1396,7 @@
     if (catalogPromise) return catalogPromise;
 
     catalogPromise = (async () => {
-      const cacheKey = `xet-catalog-v3:${courseId}`;
+      const cacheKey = `xet-catalog-v4:${courseId}`;
 
       if (!force) {
         try {
@@ -1350,6 +1405,7 @@
             catalogTree = cached.groups;
             catalogCourseId = courseId;
             catalogFetchedAt = cached.ts;
+            playlistSeriesIndex = -1;
             return catalogTree;
           }
         } catch (_) {}
@@ -1386,6 +1442,7 @@
       catalogTree = buildCatalogTree(top, childMap, seriesEntries);
       catalogCourseId = courseId;
       catalogFetchedAt = Date.now();
+      playlistSeriesIndex = -1;
 
       const hasError = [...childMap.values()].some((entry) => entry.error);
       if (!hasError) {
@@ -1419,6 +1476,34 @@
       }
     }
     return sections;
+  }
+
+  function seriesCatalogGroups() {
+    return (catalogTree || []).filter(
+      (group) =>
+        group.series &&
+        (group.chapters || []).some(
+          (chapter) => (chapter.sections || []).length > 0 || chapter.error
+        )
+    );
+  }
+
+  function usesSeriesTabs() {
+    return seriesCatalogGroups().length > 1;
+  }
+
+  function displayCatalogGroups() {
+    const seriesGroups = seriesCatalogGroups();
+    return seriesGroups.length ? seriesGroups : catalogTree || [];
+  }
+
+  function findGroupIndexForRid(groups, rid) {
+    if (!rid) return -1;
+    return groups.findIndex((group) =>
+      (group.chapters || []).some((chapter) =>
+        (chapter.sections || []).some((section) => section.rid === rid)
+      )
+    );
   }
 
   function findCatalogSection(rid) {
@@ -1562,6 +1647,7 @@
       <div class="xet-pl-search-wrap">
         <input class="xet-pl-search" type="search" placeholder="搜索章节、课时或编号" autocomplete="off">
       </div>
+      <div class="xet-pl-series-tabs" role="tablist" aria-label="课程系列" hidden></div>
       <div class="xet-pl-body"></div>
     `;
 
@@ -1694,10 +1780,21 @@
     clearTimeout(hoverCloseTimer);
   }
 
+  function clearSeriesTabs() {
+    if (!playlistPanel) return;
+    playlistPanel.classList.remove('has-series');
+    const tabs = playlistPanel.querySelector('.xet-pl-series-tabs');
+    if (tabs) {
+      tabs.hidden = true;
+      tabs.replaceChildren();
+    }
+  }
+
   function renderPlaylistMessage(message) {
     if (!playlistPanel) return;
     const body = playlistPanel.querySelector('.xet-pl-body');
     if (!body) return;
+    clearSeriesTabs();
     const element = document.createElement('div');
     element.className = 'xet-pl-message';
     element.textContent = message;
@@ -1708,6 +1805,7 @@
     if (!playlistPanel) return;
     const body = playlistPanel.querySelector('.xet-pl-body');
     if (!body) return;
+    clearSeriesTabs();
 
     const wrap = document.createElement('div');
     wrap.className = 'xet-pl-message';
@@ -1845,7 +1943,77 @@
     return row;
   }
 
-  function renderPlaylist() {
+  function cleanSeriesLabel(label) {
+    return String(label || '')
+      .replace(/^=+\s*/, '')
+      .replace(/\s*=+$/, '')
+      .trim();
+  }
+
+  function selectSeriesTab(index) {
+    const groups = displayCatalogGroups();
+    if (!usesSeriesTabs() || !Number.isInteger(index) || index < 0 || index >= groups.length) return;
+    if (index === playlistSeriesIndex) return;
+
+    playlistSeriesIndex = index;
+    playlistRestoreScroll = false;
+    const body = playlistPanel?.querySelector('.xet-pl-body');
+    if (body) body.scrollTop = 0;
+    renderPlaylist({ lockSize: false });
+    requestAnimationFrame(() => {
+      playlistPanel?.querySelector('.xet-pl-series-tab.active')?.focus({ preventScroll: true });
+    });
+  }
+
+  function renderSeriesTabs(groups, enabled) {
+    if (!playlistPanel) return;
+    const tabs = playlistPanel.querySelector('.xet-pl-series-tabs');
+    if (!tabs) return;
+
+    playlistPanel.classList.toggle('has-series', enabled);
+    tabs.hidden = !enabled;
+    if (!enabled) {
+      tabs.replaceChildren();
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    groups.forEach((group, index) => {
+      const label = cleanSeriesLabel(group.label) || '未命名系列';
+      const tab = document.createElement('button');
+      tab.type = 'button';
+      tab.className = 'xet-pl-series-tab';
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-selected', index === playlistSeriesIndex ? 'true' : 'false');
+      tab.tabIndex = index === playlistSeriesIndex ? 0 : -1;
+      tab.textContent = label;
+      tab.title = label;
+      tab.classList.toggle('active', index === playlistSeriesIndex);
+
+      tab.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        selectSeriesTab(index);
+      });
+
+      fragment.appendChild(tab);
+    });
+
+    tabs.replaceChildren(fragment);
+    requestAnimationFrame(() => {
+      const active = tabs.querySelector('.xet-pl-series-tab.active');
+      if (!active) return;
+      const tabsRect = tabs.getBoundingClientRect();
+      const activeRect = active.getBoundingClientRect();
+      if (activeRect.left < tabsRect.left) {
+        tabs.scrollLeft -= tabsRect.left - activeRect.left;
+      } else if (activeRect.right > tabsRect.right) {
+        tabs.scrollLeft += activeRect.right - tabsRect.right;
+      }
+    });
+  }
+
+  function renderPlaylist({ lockSize = true } = {}) {
     if (!playlistPanel || !catalogTree) return;
     const body = playlistPanel.querySelector('.xet-pl-body');
     const count = playlistPanel.querySelector('.xet-pl-count');
@@ -1855,14 +2023,24 @@
     ensureChapterState();
     playlistActiveRid = activeRid;
     playlistCurrentChapterId = findCurrentChapterId(activeRid);
+    const groups = displayCatalogGroups();
+    const tabsEnabled = usesSeriesTabs();
+    const currentGroupIndex = findGroupIndexForRid(groups, activeRid);
+
+    if (playlistSeriesIndex < 0 || playlistSeriesIndex >= groups.length) {
+      playlistSeriesIndex = currentGroupIndex >= 0 ? currentGroupIndex : 0;
+    }
+
+    renderSeriesTabs(groups, tabsEnabled);
+    const visibleGroups = tabsEnabled ? [groups[playlistSeriesIndex]] : groups;
     const fragment = document.createDocumentFragment();
     let total = 0;
 
-    for (const group of catalogTree) {
-      if (group.label) {
+    for (const group of visibleGroups) {
+      if (!tabsEnabled && group.label) {
         const label = document.createElement('div');
         label.className = 'xet-pl-group';
-        label.textContent = group.label.replace(/^=+\s*/, '').replace(/\s*=+$/, '');
+        label.textContent = cleanSeriesLabel(group.label);
         fragment.appendChild(label);
       }
 
@@ -1881,7 +2059,17 @@
           title.title = chapter.title;
           const amount = document.createElement('span');
           amount.className = 'xet-pl-chapter-count';
-          amount.textContent = chapter.error ? '加载失败' : String(chapter.sections.length);
+          const doneCount = chapter.sections.filter((section) => section.status === 2).length;
+          const learningCount = chapter.sections.filter(
+            (section) => section.status !== 2 && (section.status === 1 || section.progress > 0)
+          ).length;
+          const countParts = [`${chapter.sections.length} 节`];
+          if (doneCount) countParts.push(`已学完 ${doneCount}`);
+          if (learningCount) countParts.push(`学习中 ${learningCount}`);
+          amount.textContent = chapter.error ? '加载失败' : countParts.join(' · ');
+          if (!chapter.error) {
+            amount.title = `共 ${chapter.sections.length} 节，已学完 ${doneCount} 节，学习中 ${learningCount} 节`;
+          }
           const chevron = document.createElement('span');
           chevron.className = 'xet-pl-chevron';
           chevron.textContent = '▾';
@@ -1911,7 +2099,7 @@
 
     if (count) count.textContent = `${total} 节`;
     body.replaceChildren(fragment);
-    lockPlaylistSize();
+    if (lockSize) lockPlaylistSize();
     applyPlaylistFilter();
     requestAnimationFrame(() => {
       if (playlistRestoreScroll) {
@@ -1945,7 +2133,6 @@
     const numericValue = numeric ? canonicalNumber(numericMatch[1]) : '';
     let groupLabel = null;
     let matchedAny = false;
-
     for (const node of body.children) {
       if (node.classList.contains('xet-pl-group')) {
         groupLabel = node;
@@ -1995,9 +2182,9 @@
       if (!empty) {
         empty = document.createElement('div');
         empty.className = 'xet-pl-empty';
-        empty.textContent = '没有匹配的课时';
         body.appendChild(empty);
       }
+      empty.textContent = usesSeriesTabs() ? '当前系列没有匹配的课时' : '没有匹配的课时';
     } else if (empty) {
       empty.remove();
     }
@@ -2012,17 +2199,26 @@
 
     let show = false;
     if (!playlistPanel.hidden) {
-      const row = body.querySelector('.xet-pl-item.current');
-      if (row) {
-        const chapter = row.closest('.xet-pl-chapter');
-        const blocked =
-          !chapter || chapter.hidden || chapter.classList.contains('collapsed') || row.hidden;
-        if (blocked) {
-          show = true;
-        } else {
-          const rowRect = row.getBoundingClientRect();
-          const bodyRect = body.getBoundingClientRect();
-          show = rowRect.bottom <= bodyRect.top || rowRect.top >= bodyRect.bottom;
+      const groups = displayCatalogGroups();
+      const currentGroupIndex = findGroupIndexForRid(groups, getCurrentResourceId());
+      const currentInOtherTab =
+        usesSeriesTabs() && currentGroupIndex >= 0 && currentGroupIndex !== playlistSeriesIndex;
+
+      if (currentInOtherTab) {
+        show = true;
+      } else {
+        const row = body.querySelector('.xet-pl-item.current');
+        if (row) {
+          const chapter = row.closest('.xet-pl-chapter');
+          const blocked =
+            !chapter || chapter.hidden || chapter.classList.contains('collapsed') || row.hidden;
+          if (blocked) {
+            show = true;
+          } else {
+            const rowRect = row.getBoundingClientRect();
+            const bodyRect = body.getBoundingClientRect();
+            show = rowRect.bottom <= bodyRect.top || rowRect.top >= bodyRect.bottom;
+          }
         }
       }
     }
@@ -2032,6 +2228,20 @@
 
   function locateCurrentLesson() {
     if (!playlistPanel) return;
+
+    const groups = displayCatalogGroups();
+    const currentGroupIndex = findGroupIndexForRid(groups, getCurrentResourceId());
+    if (usesSeriesTabs() && currentGroupIndex >= 0 && currentGroupIndex !== playlistSeriesIndex) {
+      playlistSeriesIndex = currentGroupIndex;
+      playlistRestoreScroll = false;
+      if (playlistSearch) {
+        playlistSearch = '';
+        const input = playlistPanel.querySelector('.xet-pl-search');
+        if (input) input.value = '';
+      }
+      renderPlaylist({ lockSize: false });
+    }
+
     const body = playlistPanel.querySelector('.xet-pl-body');
     const row = body?.querySelector('.xet-pl-item.current');
     if (!body || !row) return;
@@ -2083,7 +2293,12 @@
     const rid = getCurrentResourceId();
     if (rid === playlistActiveRid) return;
     playlistActiveRid = rid;
-    if (playlistOpen) renderPlaylist();
+
+    const groups = displayCatalogGroups();
+    const groupIndex = findGroupIndexForRid(groups, rid);
+    if (groupIndex >= 0) playlistSeriesIndex = groupIndex;
+
+    if (playlistOpen) renderPlaylist({ lockSize: false });
   }
 
   function sectionUrl(section) {
@@ -2163,6 +2378,27 @@
       closePlaylist();
       return;
     }
+
+    const tab =
+      playlistPanel && event.target instanceof Element
+        ? event.target.closest('.xet-pl-series-tab')
+        : null;
+    if (tab && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+      const tabs = [...playlistPanel.querySelectorAll('.xet-pl-series-tab')];
+      const index = tabs.indexOf(tab);
+      if (index >= 0) {
+        event.preventDefault();
+        let next = index;
+        if (event.key === 'ArrowLeft') next = (index - 1 + tabs.length) % tabs.length;
+        else if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+        else if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = tabs.length - 1;
+        selectSeriesTab(next);
+        event.stopImmediatePropagation();
+        return;
+      }
+    }
+
     if (playlistPanel && event.target instanceof Node && playlistPanel.contains(event.target)) {
       event.stopImmediatePropagation();
     }
@@ -2257,6 +2493,7 @@
     updatePlaylistCurrent();
     if (playlistOpen) ensurePlaylistPanel();
     scheduleCatalogPrefetch();
+    scheduleInitialWideMode();
   }
 
   function scheduleUpdate() {
@@ -2286,6 +2523,7 @@
       catalogFetchedAt = 0;
       catalogPromise = null;
       playlistActiveRid = '';
+      playlistSeriesIndex = -1;
       playlistSearch = '';
       playlistCurrentChapterId = '';
       chapterOverrides = new Map();
@@ -2295,6 +2533,10 @@
       clearTimeout(playlistPrefetchTimer);
       playlistPrefetchTimer = 0;
       catalogPrefetchDone = false;
+      clearTimeout(wideRetryTimer);
+      wideRetryTimer = 0;
+      wideRetryCount = 0;
+      initialWideDone = false;
       document.documentElement.classList.remove('xet-rebuild', 'xet-fs-wide', 'xet-native-full');
       if (document.body) {
         document.body.classList.remove('xet-rebuild', 'xet-fs-wide', 'xet-native-full');
@@ -2374,6 +2616,40 @@
     const entered = clickSiteControl('.xgplayer-cssfullscreen .xgplayer-icon, .xgplayer-cssfullscreen');
     scheduleFullscreenRefresh();
     return entered;
+  }
+
+  function enterWebFullscreenWhenReady() {
+    clearTimeout(wideRetryTimer);
+    wideRetryCount = 0;
+
+    const tick = () => {
+      const root = getPlayerRoot();
+      if (
+        !isPlaybackPage() ||
+        isWebFullscreen() ||
+        isNativeFullscreen() ||
+        (root && root.matches(FULL_SEL))
+      ) {
+        return;
+      }
+      if (enterWebFullscreen()) return;
+      if (++wideRetryCount > 20) return;
+      wideRetryTimer = setTimeout(tick, 250);
+    };
+
+    tick();
+  }
+
+  function scheduleInitialWideMode() {
+    if (initialWideDone || !isPlaybackPage()) return;
+    const root = getPlayerRoot();
+    if (!root?.querySelector('video')) return;
+    if (isWebFullscreen() || isNativeFullscreen() || root.matches(FULL_SEL)) {
+      initialWideDone = true;
+      return;
+    }
+    initialWideDone = true;
+    enterWebFullscreenWhenReady();
   }
 
   function removeFullscreenClasses(root) {
