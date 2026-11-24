@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小鹅通课程页布局重构
 // @namespace    https://github.com/StreetCornelia/xet-plus
-// @version      0.3.10
+// @version      0.3.11
 // @description  重构课程页：16:9 播放器、全屏按钮、播放参数记忆、课程选集面板
 // @author       Dash
 // @match        https://*.pc.xiaoe-tech.com/p/t_pc/course_pc_detail/video/*
@@ -18,9 +18,11 @@
   'use strict';
 
   const STYLE_ID = 'xet-layout-style';
-  const STYLE_VERSION = '0.3.10';
+  const STYLE_VERSION = '0.3.11';
   const PREFS_KEY = 'xet-playback-prefs-v1';
   const CATALOG_API = '/xe.course.business_go.avoidlogin.e_course.resource_catalog_list.get/1.0.0';
+  const SUB_CATALOG_API = '/xe.course.business_go.avoidlogin.e_course.sub.course.list/1.0.0';
+  const CHAPTER_STATE_KEY = 'xet-playlist-chapters-v1';
   const CATALOG_TTL = 10 * 60 * 1000;
   const APPLY_DELAY = 1200;
   const APPLY_RETRY = 200;
@@ -62,6 +64,11 @@
   let applyTimer = 0;
   let applyRetryTimer = 0;
   let applying = false;
+  let volumeGestureUntil = 0;
+  let rateGestureUntil = 0;
+  let startupUntil = 0;
+  let startupRepairCount = 0;
+  let playRestoreDone = false;
   let pageActive = null;
   let catalogTree = null;
   let catalogCourseId = '';
@@ -71,9 +78,16 @@
   let playlistPanel = null;
   let playlistOpen = false;
   let playlistSearch = '';
+  let playlistScrollTop = 0;
+  let playlistRestoreScroll = false;
   let playlistActiveRid = '';
+  let playlistCurrentChapterId = '';
   let playlistPrefetchTimer = 0;
   let catalogPrefetchDone = false;
+  let chapterOverrides = new Map();
+  let chapterStateCourseId = '';
+  let hoverOpenTimer = 0;
+  let hoverCloseTimer = 0;
 
   function isPlaybackPage() {
     return /\/course_pc_detail\/video\/[^/]*v_[A-Za-z0-9]+/.test(location.pathname);
@@ -134,6 +148,20 @@
         > #pc_course_fe_basic_video:not(.xgplayer-is-css-fullscreen):not(.xgplayer-is-cssfullscreen):not(.xgplayer-is-fullscreen):not(.xgplayer-page-fullscreen) {
         width: 100% !important;
         height: 100% !important;
+      }
+
+      body.xet-rebuild .video-player xg-poster,
+      body.xet-rebuild .video-player .xgplayer-poster {
+        width: 100% !important;
+        height: 100% !important;
+        left: 0 !important;
+        top: 0 !important;
+        right: auto !important;
+        bottom: auto !important;
+        margin: 0 !important;
+        transform: none !important;
+        background-size: cover !important;
+        background-position: center !important;
       }
 
       body.xet-rebuild .video-title {
@@ -228,7 +256,8 @@
         right: 12px;
         bottom: 72px;
         z-index: 50;
-        width: min(380px, calc(100% - 24px));
+        width: max-content;
+        max-width: min(50vw, calc(100% - 24px));
         max-height: calc(100% - 84px);
         display: flex;
         flex-direction: column;
@@ -246,6 +275,17 @@
 
       body.xet-rebuild .xet-playlist-panel[hidden] {
         display: none !important;
+      }
+
+      body.xet-rebuild .xet-playlist-panel [hidden] {
+        display: none !important;
+      }
+
+      body.xet-rebuild .xet-playlist-panel,
+      body.xet-rebuild .xet-playlist-panel *,
+      body.xet-rebuild .xet-playlist-panel *::before,
+      body.xet-rebuild .xet-playlist-panel *::after {
+        box-sizing: border-box;
       }
 
       @keyframes xet-pl-in {
@@ -277,8 +317,50 @@
         color: rgba(255, 255, 255, 0.45);
       }
 
-      body.xet-rebuild .xet-pl-close {
+      body.xet-rebuild .xet-pl-actions {
+        display: flex;
+        align-items: center;
+        gap: 2px;
         margin-left: auto;
+      }
+
+      body.xet-rebuild .xet-pl-action {
+        position: relative;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        padding: 0;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: rgba(255, 255, 255, 0.55);
+        cursor: pointer;
+      }
+
+      body.xet-rebuild .xet-pl-action:hover {
+        background: rgba(255, 255, 255, 0.08);
+        color: #fff;
+      }
+
+      body.xet-rebuild .xet-pl-locate.is-hidden {
+        visibility: hidden;
+        pointer-events: none;
+      }
+
+      body.xet-rebuild .xet-pl-action svg {
+        width: 14px;
+        height: 14px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      body.xet-rebuild .xet-pl-close {
+        position: relative;
         width: 26px;
         height: 26px;
         padding: 0;
@@ -289,6 +371,38 @@
         font-size: 20px;
         line-height: 1;
         cursor: pointer;
+      }
+
+      body.xet-rebuild .xet-pl-action::after,
+      body.xet-rebuild .xet-pl-close::after {
+        content: attr(data-tip);
+        position: absolute;
+        top: calc(100% + 6px);
+        left: 50%;
+        z-index: 5;
+        padding: 3px 7px;
+        border-radius: 4px;
+        background: rgba(4, 8, 14, 0.94);
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+        color: #dfe8f4;
+        font-size: 11px;
+        font-weight: 400;
+        line-height: 1.35;
+        white-space: nowrap;
+        pointer-events: none;
+        opacity: 0;
+        visibility: hidden;
+        transform: translate(-50%, -2px);
+        transition: opacity 0.12s ease, transform 0.12s ease;
+      }
+
+      body.xet-rebuild .xet-pl-action:hover::after,
+      body.xet-rebuild .xet-pl-action:focus-visible::after,
+      body.xet-rebuild .xet-pl-close:hover::after,
+      body.xet-rebuild .xet-pl-close:focus-visible::after {
+        opacity: 1;
+        visibility: visible;
+        transform: translate(-50%, 0);
       }
 
       body.xet-rebuild .xet-pl-close:hover {
@@ -325,6 +439,7 @@
         position: relative;
         flex: 1 1 auto;
         overflow-y: auto;
+        overflow-x: hidden;
         padding: 2px 0 8px;
       }
 
@@ -435,6 +550,13 @@
         text-overflow: ellipsis;
       }
 
+      body.xet-rebuild .xet-pl-item-title mark,
+      body.xet-rebuild .xet-pl-chapter-title mark {
+        background: rgba(74, 168, 255, 0.24);
+        color: #cfe7ff;
+        border-radius: 2px;
+      }
+
       body.xet-rebuild .xet-pl-item-meta {
         flex: 0 0 auto;
         font-size: 11px;
@@ -460,6 +582,13 @@
         color: rgba(255, 255, 255, 0.55);
         font-size: 12px;
         line-height: 1.7;
+      }
+
+      body.xet-rebuild .xet-pl-empty {
+        padding: 26px 16px;
+        text-align: center;
+        color: rgba(255, 255, 255, 0.45);
+        font-size: 12px;
       }
 
       body.xet-rebuild .xet-pl-retry {
@@ -553,8 +682,27 @@
     } catch (_) {}
   }
 
+  function notePreferenceGesture(event) {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const until = Date.now() + 3000;
+    if (target.closest('.xgplayer-volume')) {
+      volumeGestureUntil = until;
+      startupUntil = 0;
+    }
+    if (target.closest('.xgplayer-playbackrate')) rateGestureUntil = until;
+  }
+
   function onVolumeChange() {
     if (applying) return;
+    const now = Date.now();
+    if (now > volumeGestureUntil) {
+      if (now < startupUntil && startupRepairCount < 3) {
+        startupRepairCount += 1;
+        armApply();
+      }
+      return;
+    }
     const video = getActiveVideo();
     if (!video) return;
     savePlaybackPrefs({ volume: video.volume, muted: !!video.muted });
@@ -562,6 +710,7 @@
 
   function onRateChange() {
     if (applying) return;
+    if (Date.now() > rateGestureUntil) return;
     const video = getActiveVideo();
     if (!video) return;
     const rate = normalizeRate(video.playbackRate);
@@ -667,6 +816,18 @@
   }
 
   function onVideoLoaded() {
+    startupUntil = Date.now() + 15000;
+    startupRepairCount = 0;
+    playRestoreDone = false;
+    armApply();
+  }
+
+  function onVideoPlaying() {
+    if (playRestoreDone) return;
+    playRestoreDone = true;
+    startupUntil = Date.now() + 15000;
+    startupRepairCount = 0;
+    if (Date.now() <= volumeGestureUntil) return;
     armApply();
   }
 
@@ -678,14 +839,19 @@
       watchedVideo.removeEventListener('loadedmetadata', onVideoLoaded);
       watchedVideo.removeEventListener('loadstart', onVideoLoaded);
       watchedVideo.removeEventListener('emptied', onVideoLoaded);
+      watchedVideo.removeEventListener('playing', onVideoPlaying);
       watchedVideo.removeEventListener('volumechange', onVolumeChange);
       watchedVideo.removeEventListener('ratechange', onRateChange);
     }
 
     watchedVideo = video;
+    startupUntil = Date.now() + 15000;
+    startupRepairCount = 0;
+    playRestoreDone = false;
     video.addEventListener('loadedmetadata', onVideoLoaded);
     video.addEventListener('loadstart', onVideoLoaded);
     video.addEventListener('emptied', onVideoLoaded);
+    video.addEventListener('playing', onVideoPlaying);
     video.addEventListener('volumechange', onVolumeChange);
     video.addEventListener('ratechange', onRateChange);
 
@@ -768,7 +934,70 @@
     };
   }
 
-  function buildCatalogTree(top, childMap) {
+  function makeCatalogChapter(item, childMap) {
+    const entry = childMap.get(String(item.chapter_id));
+    const list = entry ? entry.list : Array.isArray(item.children) ? item.children : [];
+    return {
+      id: String(item.chapter_id || ''),
+      title: String(item.chapter_title || '').trim(),
+      error: !!(entry && entry.error),
+      sections: list.map(normalizeSection).filter((section) => section.rid && section.title)
+    };
+  }
+
+  function buildCatalogTree(top, childMap, seriesEntries) {
+    const series = Array.isArray(seriesEntries) ? seriesEntries : [];
+    const hasSeries = series.length > 0 && top.some((item) => String(item.sub_course_id || ''));
+
+    if (hasSeries) {
+      const groups = [];
+      const byId = new Map();
+
+      for (const entry of series) {
+        const group = { label: entry.title || '未命名系列', chapters: [] };
+        byId.set(entry.id, group);
+        groups.push(group);
+      }
+
+      let fallback = null;
+
+      for (const item of top) {
+        const sectionNum = Math.max(0, Number(item.section_num) || 0);
+        const type = Number(item.resource_type) || 0;
+        let group = byId.get(String(item.sub_course_id || ''));
+
+        if (!group) {
+          if (!fallback) {
+            fallback = { label: '', chapters: [] };
+            groups.push(fallback);
+          }
+          group = fallback;
+        }
+
+        if (type === 0 && !sectionNum) {
+          group.chapters.push({
+            id: String(item.chapter_id || ''),
+            title: String(item.chapter_title || '').trim(),
+            sections: []
+          });
+          continue;
+        }
+
+        if (type !== 0 && !sectionNum) {
+          group.chapters.push({
+            id: String(item.chapter_id || ''),
+            title: '',
+            sections: [normalizeSection(item)]
+          });
+          continue;
+        }
+
+        group.chapters.push(makeCatalogChapter(item, childMap));
+      }
+
+      return groups.filter((group) => group.label || group.chapters.length);
+    }
+
     const groups = [];
     let group = { label: '', chapters: [] };
     groups.push(group);
@@ -792,14 +1021,7 @@
         continue;
       }
 
-      const entry = childMap.get(String(item.chapter_id));
-      const list = entry ? entry.list : Array.isArray(item.children) ? item.children : [];
-      group.chapters.push({
-        id: String(item.chapter_id || ''),
-        title: String(item.chapter_title || '').trim(),
-        error: !!(entry && entry.error),
-        sections: list.map(normalizeSection).filter((section) => section.rid && section.title)
-      });
+      group.chapters.push(makeCatalogChapter(item, childMap));
     }
 
     return groups.filter((group) => group.label || group.chapters.length);
@@ -831,6 +1053,35 @@
     return (data.data && data.data.list) || [];
   }
 
+  async function subCourseRequest() {
+    const courseId = getCourseId();
+    const appId = getCourseAppId();
+    if (!courseId || !appId) return [];
+
+    const response = await fetch(SUB_CATALOG_API, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', app_id: appId },
+      body: JSON.stringify({
+        bizData: {
+          app_id: appId,
+          course_id: courseId,
+          page: 1,
+          page_size: 1000
+        }
+      })
+    });
+
+    if (!response.ok) throw new Error(`系列请求失败 (${response.status})`);
+    const data = await response.json();
+    if (!data || data.code !== 0) throw new Error((data && data.msg) || '系列请求失败');
+
+    const payload = data.data;
+    if (Array.isArray(payload)) return payload;
+    if (payload && Array.isArray(payload.list)) return payload.list;
+    return [];
+  }
+
   async function mapLimit(items, limit, fn) {
     const results = new Array(items.length);
     let next = 0;
@@ -851,7 +1102,7 @@
     if (catalogPromise) return catalogPromise;
 
     catalogPromise = (async () => {
-      const cacheKey = `xet-catalog-v2:${courseId}`;
+      const cacheKey = `xet-catalog-v3:${courseId}`;
 
       if (!force) {
         try {
@@ -865,7 +1116,18 @@
         } catch (_) {}
       }
 
-      const top = await catalogRequest({});
+      const [top, rawSeries] = await Promise.all([
+        catalogRequest({}),
+        subCourseRequest().catch(() => [])
+      ]);
+      const seriesEntries = rawSeries
+        .map((entry, index) => ({
+          id: String(entry.sub_course_id || ''),
+          title: String(
+            entry.chapter_title || entry.sub_course_title || entry.resource_title || entry.title || `系列 ${index + 1}`
+          ).trim()
+        }))
+        .filter((entry) => entry.id);
       const chapters = top.filter(
         (item) =>
           (Number(item.section_num) || 0) > 0 &&
@@ -882,7 +1144,7 @@
         }
       });
 
-      catalogTree = buildCatalogTree(top, childMap);
+      catalogTree = buildCatalogTree(top, childMap, seriesEntries);
       catalogCourseId = courseId;
       catalogFetchedAt = Date.now();
 
@@ -924,6 +1186,65 @@
     return allCatalogSections().find((section) => section.rid === rid) || null;
   }
 
+  function ensureChapterState() {
+    const courseId = getCourseId();
+    if (chapterStateCourseId === courseId) return;
+    chapterStateCourseId = courseId;
+    chapterOverrides = new Map();
+    if (!courseId) return;
+
+    try {
+      const raw = JSON.parse(localStorage.getItem(`${CHAPTER_STATE_KEY}:${courseId}`) || 'null');
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        for (const [id, value] of Object.entries(raw)) {
+          if (typeof value === 'boolean') chapterOverrides.set(id, value);
+        }
+      }
+    } catch (_) {}
+  }
+
+  function saveChapterState() {
+    if (!chapterStateCourseId) return;
+    try {
+      const raw = {};
+      for (const [id, value] of chapterOverrides) raw[id] = value;
+      localStorage.setItem(`${CHAPTER_STATE_KEY}:${chapterStateCourseId}`, JSON.stringify(raw));
+    } catch (_) {}
+  }
+
+  function isChapterExpanded(chapterId) {
+    if (chapterOverrides.has(chapterId)) return chapterOverrides.get(chapterId);
+    return !!playlistCurrentChapterId && chapterId === playlistCurrentChapterId;
+  }
+
+  function findCurrentChapterId(rid) {
+    if (!rid) return '';
+    for (const group of catalogTree || []) {
+      for (const chapter of group.chapters || []) {
+        if ((chapter.sections || []).some((section) => section.rid === rid)) return chapter.id;
+      }
+    }
+    return '';
+  }
+
+  function setAllChapters(expanded) {
+    ensureChapterState();
+    if (!catalogTree || !playlistPanel) return;
+
+    playlistSearch = '';
+    const searchInput = playlistPanel.querySelector('.xet-pl-search');
+    if (searchInput) searchInput.value = '';
+
+    for (const group of catalogTree) {
+      for (const chapter of group.chapters) {
+        if (chapter.id) chapterOverrides.set(chapter.id, expanded);
+      }
+    }
+
+    saveChapterState();
+    applyPlaylistFilter();
+  }
+
   function ensurePlaylistControl() {
     const root = getPlayerRoot();
     if (!root) return;
@@ -935,6 +1256,7 @@
     const existing = grid.querySelector('.xgplayer-playlist');
     if (existing) {
       playlistButton = existing;
+      bindPlaylistHover(existing);
       return;
     }
 
@@ -952,12 +1274,20 @@
       event.stopPropagation();
       togglePlaylist();
     });
+    bindPlaylistHover(button);
 
     const rate = grid.querySelector('.xgplayer-playbackrate');
     if (rate) rate.insertAdjacentElement('afterend', button);
     else grid.appendChild(button);
 
     playlistButton = button;
+  }
+
+  function bindPlaylistHover(element) {
+    if (!element || element.dataset.xetHoverBound) return;
+    element.dataset.xetHoverBound = '1';
+    element.addEventListener('mouseenter', schedulePlaylistOpen);
+    element.addEventListener('mouseleave', schedulePlaylistClose);
   }
 
   function ensurePlaylistPanel() {
@@ -972,18 +1302,45 @@
     panel.setAttribute('role', 'dialog');
     panel.setAttribute('aria-label', '选集');
     panel.hidden = !playlistOpen;
+    // Icons: Lucide (ISC) fold-vertical / unfold-vertical / locate-fixed.
     panel.innerHTML = `
       <div class="xet-pl-head">
         <span class="xet-pl-title">选集</span>
         <span class="xet-pl-count"></span>
-        <button class="xet-pl-close" type="button" aria-label="关闭">×</button>
+        <div class="xet-pl-actions">
+          <button class="xet-pl-action xet-pl-locate is-hidden" type="button" aria-label="定位当前课时" data-tip="定位当前课时" aria-hidden="true">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="2" x2="5" y1="12" y2="12"></line><line x1="19" x2="22" y1="12" y2="12"></line><line x1="12" x2="12" y1="2" y2="5"></line><line x1="12" x2="12" y1="19" y2="22"></line><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="3"></circle></svg>
+          </button>
+          <button class="xet-pl-action xet-pl-collapse-all" type="button" aria-label="全部折叠" data-tip="全部折叠">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 12H8"></path><path d="M12 22v-6"></path><path d="M12 8V2"></path><path d="m15 19-3-3-3 3"></path><path d="m15 5-3 3-3-3"></path><path d="M16 12h-2"></path><path d="M22 12h-2"></path><path d="M4 12H2"></path></svg>
+          </button>
+          <button class="xet-pl-action xet-pl-expand-all" type="button" aria-label="全部展开" data-tip="全部展开">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 12H8"></path><path d="M12 16v6"></path><path d="M12 2v6"></path><path d="M16 12h-2"></path><path d="M22 12h-2"></path><path d="M4 12H2"></path><path d="m9 19 3 3 3-3"></path><path d="m9 5 3-3 3 3"></path></svg>
+          </button>
+        </div>
+        <button class="xet-pl-close" type="button" aria-label="关闭" data-tip="关闭">×</button>
       </div>
       <div class="xet-pl-search-wrap">
-        <input class="xet-pl-search" type="search" placeholder="搜索章节或课时" autocomplete="off">
+        <input class="xet-pl-search" type="search" placeholder="搜索章节、课时或编号" autocomplete="off">
       </div>
       <div class="xet-pl-body"></div>
     `;
 
+    panel.querySelector('.xet-pl-collapse-all').addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setAllChapters(false);
+    });
+    panel.querySelector('.xet-pl-expand-all').addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setAllChapters(true);
+    });
+    panel.querySelector('.xet-pl-locate').addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      locateCurrentLesson();
+    });
     panel.querySelector('.xet-pl-close').addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -995,8 +1352,25 @@
       playlistSearch = String(event.target.value || '').trim().toLowerCase();
       applyPlaylistFilter();
     });
-    panel.querySelector('.xet-pl-body').addEventListener('click', onPlaylistBodyClick);
+    const body = panel.querySelector('.xet-pl-body');
+    body.addEventListener('click', onPlaylistBodyClick);
+    body.addEventListener(
+      'scroll',
+      () => {
+        updateLocateButton();
+        setTimeout(updateLocateButton, 80);
+      },
+      { passive: true }
+    );
+    body.addEventListener(
+      'wheel',
+      () => setTimeout(updateLocateButton, 80),
+      { passive: true }
+    );
+    window.addEventListener('resize', updateLocateButton, { passive: true });
 
+    panel.addEventListener('mouseenter', cancelPlaylistClose);
+    panel.addEventListener('mouseleave', schedulePlaylistClose);
     panel.addEventListener('mousedown', (event) => event.stopPropagation());
     panel.addEventListener('touchstart', (event) => event.stopPropagation(), { passive: true });
     panel.addEventListener('wheel', (event) => event.stopPropagation(), { passive: true });
@@ -1010,25 +1384,32 @@
   function onPlaylistButtonClick(event) {
     event.preventDefault();
     event.stopImmediatePropagation();
-    togglePlaylist();
+    openPlaylist();
   }
 
   function closePlaylist() {
+    clearTimeout(hoverOpenTimer);
+    clearTimeout(hoverCloseTimer);
     playlistOpen = false;
-    if (playlistPanel) playlistPanel.hidden = true;
+    if (playlistPanel) {
+      const body = playlistPanel.querySelector('.xet-pl-body');
+      if (body) playlistScrollTop = body.scrollTop;
+      if (playlistPanel.contains(document.activeElement)) document.activeElement.blur();
+      playlistPanel.hidden = true;
+    }
     if (playlistButton) playlistButton.classList.remove('active');
   }
 
-  function togglePlaylist() {
-    if (playlistOpen) {
-      closePlaylist();
-      return;
-    }
+  function openPlaylist() {
+    clearTimeout(hoverOpenTimer);
+    clearTimeout(hoverCloseTimer);
+    if (playlistOpen) return;
 
     const panel = ensurePlaylistPanel();
     if (!panel) return;
 
     playlistOpen = true;
+    playlistRestoreScroll = !!playlistSearch;
     panel.hidden = false;
     if (playlistButton) playlistButton.classList.add('active');
 
@@ -1045,6 +1426,33 @@
       .catch((error) => {
         if (playlistOpen) renderPlaylistError(error);
       });
+  }
+
+  function togglePlaylist() {
+    if (playlistOpen) closePlaylist();
+    else openPlaylist();
+  }
+
+  function schedulePlaylistOpen() {
+    clearTimeout(hoverCloseTimer);
+    if (playlistOpen) return;
+    clearTimeout(hoverOpenTimer);
+    hoverOpenTimer = setTimeout(() => {
+      if (!playlistOpen) openPlaylist();
+    }, 100);
+  }
+
+  function schedulePlaylistClose() {
+    clearTimeout(hoverOpenTimer);
+    clearTimeout(hoverCloseTimer);
+    hoverCloseTimer = setTimeout(() => {
+      if (!playlistOpen) return;
+      closePlaylist();
+    }, 250);
+  }
+
+  function cancelPlaylistClose() {
+    clearTimeout(hoverCloseTimer);
   }
 
   function renderPlaylistMessage(message) {
@@ -1094,12 +1502,79 @@
     body.replaceChildren(wrap);
   }
 
+  function getSectionNumber(text) {
+    const match = String(text || '')
+      .trim()
+      .match(/^(\d+(?:[.\-]\d+)*)(?=[.\-、\s:：]|$)/);
+    return match ? match[1] : '';
+  }
+
+  function canonicalNumber(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    return text
+      .split(/[.\-]/)
+      .map((part) => String(Number(part)))
+      .join('.');
+  }
+
+  function highlightMatches(element, query, numeric) {
+    if (!element) return;
+    const raw = element.textContent || '';
+    const highlighted = element.dataset.xetHighlighted === '1';
+    if (!query) {
+      if (highlighted) {
+        element.textContent = raw;
+        delete element.dataset.xetHighlighted;
+      }
+      return;
+    }
+
+    const ranges = [];
+    if (numeric) {
+      const number = getSectionNumber(raw);
+      const index = number ? raw.indexOf(number) : -1;
+      if (index >= 0) ranges.push([index, index + number.length]);
+    } else {
+      const lower = raw.toLowerCase();
+      const needle = query.toLowerCase();
+      let from = 0;
+      while (needle) {
+        const index = lower.indexOf(needle, from);
+        if (index < 0) break;
+        ranges.push([index, index + needle.length]);
+        from = index + Math.max(1, needle.length);
+      }
+    }
+
+    if (!ranges.length) {
+      if (highlighted) {
+        element.textContent = raw;
+        delete element.dataset.xetHighlighted;
+      }
+      return;
+    }
+
+    element.textContent = '';
+    let cursor = 0;
+    for (const [start, end] of ranges) {
+      if (start > cursor) element.appendChild(document.createTextNode(raw.slice(cursor, start)));
+      const mark = document.createElement('mark');
+      mark.textContent = raw.slice(start, end);
+      element.appendChild(mark);
+      cursor = end;
+    }
+    if (cursor < raw.length) element.appendChild(document.createTextNode(raw.slice(cursor)));
+    element.dataset.xetHighlighted = '1';
+  }
+
   function createPlaylistRow(chapter, section, activeRid) {
     const row = document.createElement('button');
     row.type = 'button';
     row.className = 'xet-pl-item';
     row.dataset.rid = section.rid;
-    row.dataset.search = `${chapter.title} ${section.title}`.toLowerCase();
+    row.dataset.number = getSectionNumber(section.title);
+    row.dataset.search = String(section.title || '').toLowerCase();
     row.title = section.title;
 
     if (section.rid === activeRid) {
@@ -1138,7 +1613,9 @@
     if (!body) return;
 
     const activeRid = getCurrentResourceId();
+    ensureChapterState();
     playlistActiveRid = activeRid;
+    playlistCurrentChapterId = findCurrentChapterId(activeRid);
     const fragment = document.createDocumentFragment();
     let total = 0;
 
@@ -1153,6 +1630,7 @@
       for (const chapter of group.chapters) {
         const wrap = document.createElement('div');
         wrap.className = 'xet-pl-chapter';
+        if (chapter.id) wrap.dataset.chapterId = chapter.id;
 
         if (chapter.title) {
           const head = document.createElement('button');
@@ -1194,8 +1672,28 @@
 
     if (count) count.textContent = `${total} 节`;
     body.replaceChildren(fragment);
+    lockPlaylistSize();
     applyPlaylistFilter();
-    requestAnimationFrame(scrollPlaylistToCurrent);
+    requestAnimationFrame(() => {
+      if (playlistRestoreScroll) {
+        playlistRestoreScroll = false;
+        body.scrollTop = playlistScrollTop;
+      } else {
+        scrollPlaylistToCurrent();
+      }
+      updateLocateButton();
+    });
+  }
+
+  function lockPlaylistSize() {
+    if (!playlistPanel || playlistPanel.hidden) return;
+    // Measure with every chapter expanded, then keep the panel size while searching.
+    playlistPanel.style.width = '';
+    playlistPanel.style.height = '';
+    const width = Math.ceil(playlistPanel.getBoundingClientRect().width);
+    if (width > 0) playlistPanel.style.width = `${width}px`;
+    const height = Math.ceil(playlistPanel.getBoundingClientRect().height);
+    if (height > 0) playlistPanel.style.height = `${height}px`;
   }
 
   function applyPlaylistFilter() {
@@ -1203,7 +1701,11 @@
     const body = playlistPanel.querySelector('.xet-pl-body');
     if (!body) return;
     const query = playlistSearch;
+    const numericMatch = query.match(/^(\d+(?:[.\-]\d+)*)[.\-]?$/);
+    const numeric = !!numericMatch;
+    const numericValue = numeric ? canonicalNumber(numericMatch[1]) : '';
     let groupLabel = null;
+    let matchedAny = false;
 
     for (const node of body.children) {
       if (node.classList.contains('xet-pl-group')) {
@@ -1214,20 +1716,117 @@
       if (!node.classList.contains('xet-pl-chapter')) continue;
 
       const rows = [...node.querySelectorAll('.xet-pl-item')];
-      const chapterTitle = (node.querySelector('.xet-pl-chapter-title')?.textContent || '').toLowerCase();
-      const chapterMatch = !!query && chapterTitle.includes(query);
+      const chapterTitleEl = node.querySelector('.xet-pl-chapter-title');
+      const chapterTitle = (chapterTitleEl?.textContent || '').toLowerCase();
+      const chapterMatch = !numeric && !!query && chapterTitle.includes(query);
+      const chapterId = node.dataset.chapterId || '';
       let visible = 0;
 
+      if (chapterTitleEl) highlightMatches(chapterTitleEl, numeric ? '' : query, false);
+
       for (const row of rows) {
-        const match = !query || chapterMatch || (row.dataset.search || '').includes(query);
+        const match =
+          !query ||
+          (numeric
+            ? canonicalNumber(row.dataset.number) === numericValue
+            : (row.dataset.search || '').includes(query));
         row.hidden = !match;
-        if (match) visible += 1;
+        if (match) {
+          visible += 1;
+        }
+        highlightMatches(row.querySelector('.xet-pl-item-title'), match ? query : '', numeric);
       }
 
-      if (query && visible > 0) node.classList.remove('collapsed');
-      node.hidden = visible === 0;
-      if (visible > 0 && groupLabel) groupLabel.hidden = false;
+      if (query && visible > 0) {
+        node.classList.remove('collapsed');
+      } else {
+        node.classList.toggle('collapsed', !isChapterExpanded(chapterId));
+      }
+
+      const showChapter = visible > 0 || chapterMatch;
+      node.hidden = !showChapter;
+      if (showChapter) {
+        matchedAny = true;
+        if (groupLabel) groupLabel.hidden = false;
+      }
     }
+
+    let empty = body.querySelector('.xet-pl-empty');
+    if (query && !matchedAny) {
+      if (!empty) {
+        empty = document.createElement('div');
+        empty.className = 'xet-pl-empty';
+        empty.textContent = '没有匹配的课时';
+        body.appendChild(empty);
+      }
+    } else if (empty) {
+      empty.remove();
+    }
+    updateLocateButton();
+  }
+
+  function updateLocateButton() {
+    if (!playlistPanel) return;
+    const button = playlistPanel.querySelector('.xet-pl-locate');
+    const body = playlistPanel.querySelector('.xet-pl-body');
+    if (!button || !body) return;
+
+    let show = false;
+    if (!playlistPanel.hidden) {
+      const row = body.querySelector('.xet-pl-item.current');
+      if (row) {
+        const chapter = row.closest('.xet-pl-chapter');
+        const blocked =
+          !chapter || chapter.hidden || chapter.classList.contains('collapsed') || row.hidden;
+        if (blocked) {
+          show = true;
+        } else {
+          const rowRect = row.getBoundingClientRect();
+          const bodyRect = body.getBoundingClientRect();
+          show = rowRect.bottom <= bodyRect.top || rowRect.top >= bodyRect.bottom;
+        }
+      }
+    }
+    button.classList.toggle('is-hidden', !show);
+    button.setAttribute('aria-hidden', show ? 'false' : 'true');
+  }
+
+  function locateCurrentLesson() {
+    if (!playlistPanel) return;
+    const body = playlistPanel.querySelector('.xet-pl-body');
+    const row = body?.querySelector('.xet-pl-item.current');
+    if (!body || !row) return;
+
+    const input = playlistPanel.querySelector('.xet-pl-search');
+    if (playlistSearch) {
+      playlistSearch = '';
+      if (input) input.value = '';
+    }
+
+    const chapter = row.closest('.xet-pl-chapter');
+    if (chapter) {
+      chapter.hidden = false;
+      chapter.classList.remove('collapsed');
+      const id = chapter.dataset.chapterId || '';
+      if (id) {
+        chapterOverrides.set(id, true);
+        saveChapterState();
+      }
+    }
+
+    applyPlaylistFilter();
+    if (chapter) {
+      chapter.hidden = false;
+      chapter.classList.remove('collapsed');
+    }
+    row.hidden = false;
+
+    const finish = () => {
+      scrollPlaylistToCurrent();
+      updateLocateButton();
+    };
+    requestAnimationFrame(finish);
+    setTimeout(finish, 80);
   }
 
   function scrollPlaylistToCurrent() {
@@ -1236,7 +1835,7 @@
     const row = body?.querySelector('.xet-pl-item.current');
     if (!body || !row) return;
     const chapter = row.closest('.xet-pl-chapter');
-    if (chapter) chapter.classList.remove('collapsed');
+    if (row.hidden || (chapter && (chapter.hidden || chapter.classList.contains('collapsed')))) return;
     body.scrollTop = Math.max(0, row.offsetTop - body.clientHeight / 2 + row.offsetHeight / 2);
   }
 
@@ -1249,17 +1848,17 @@
   }
 
   function sectionUrl(section) {
-    if (section.jumpUrl) {
-      try {
-        return new URL(section.jumpUrl, location.origin).href;
-      } catch (_) {}
-    }
     if (section.type === 3 || /^v_/.test(section.rid)) {
       const courseId = getCourseId();
       if (!courseId) return '';
       return `/p/t_pc/course_pc_detail/video/${encodeURIComponent(
         section.rid
       )}?product_id=${encodeURIComponent(courseId)}&auto=1`;
+    }
+    if (section.jumpUrl) {
+      try {
+        return new URL(section.jumpUrl, location.origin).href;
+      } catch (_) {}
     }
     return '';
   }
@@ -1293,7 +1892,15 @@
     if (head) {
       event.preventDefault();
       event.stopPropagation();
-      head.closest('.xet-pl-chapter')?.classList.toggle('collapsed');
+      const wrap = head.closest('.xet-pl-chapter');
+      if (!wrap) return;
+      const collapsed = wrap.classList.toggle('collapsed');
+      const id = wrap.dataset.chapterId || '';
+      if (id) {
+        chapterOverrides.set(id, !collapsed);
+        saveChapterState();
+      }
+      updateLocateButton();
       return;
     }
 
@@ -1315,6 +1922,31 @@
     if (playlistPanel && event.target instanceof Node && playlistPanel.contains(event.target)) {
       event.stopImmediatePropagation();
     }
+  }
+
+  function isEditableNode(node) {
+    if (!(node instanceof HTMLElement)) return false;
+    if (node.isContentEditable) return true;
+    return !!node.closest(
+      'input, textarea, select, [contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"]'
+    );
+  }
+
+  function onGlobalKeydown(event) {
+    if (event.defaultPrevented || event.repeat || event.isComposing) return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const key = String(event.key || '').toLowerCase();
+    if (key !== 'f' && event.code !== 'KeyF') return;
+
+    const target = event.target;
+    if (isEditableNode(target)) return;
+    if (isEditableNode(document.activeElement)) return;
+    if (!isPlaybackPage() || !getPlayerRoot() || isNativeFullscreen()) return;
+
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (isWebFullscreen()) exitWebFullscreen();
+    else enterWebFullscreen();
   }
 
   function onPlaylistOutsideClick(event) {
@@ -1410,6 +2042,11 @@
       catalogPromise = null;
       playlistActiveRid = '';
       playlistSearch = '';
+      playlistCurrentChapterId = '';
+      chapterOverrides = new Map();
+      chapterStateCourseId = '';
+      clearTimeout(hoverOpenTimer);
+      clearTimeout(hoverCloseTimer);
       clearTimeout(playlistPrefetchTimer);
       playlistPrefetchTimer = 0;
       catalogPrefetchDone = false;
@@ -1479,8 +2116,18 @@
     return true;
   }
 
+  function scheduleFullscreenRefresh() {
+    for (const delay of [80, 360, 700]) {
+      setTimeout(() => {
+        if (isPlaybackPage()) updateAll();
+      }, delay);
+    }
+  }
+
   function enterWebFullscreen() {
-    return clickSiteControl('.xgplayer-cssfullscreen .xgplayer-icon, .xgplayer-cssfullscreen');
+    const entered = clickSiteControl('.xgplayer-cssfullscreen .xgplayer-icon, .xgplayer-cssfullscreen');
+    scheduleFullscreenRefresh();
+    return entered;
   }
 
   function removeFullscreenClasses(root) {
@@ -1531,6 +2178,7 @@
       updateAll();
       requestResize();
     }, 180);
+    scheduleFullscreenRefresh();
   }
 
   function exitNativeAndRestore() {
@@ -1544,7 +2192,6 @@
         if (prev === 'wide' && !isWebFullscreen()) enterWebFullscreen();
         else if (prev === 'normal' && isWebFullscreen()) exitWebFullscreen();
         restoring = false;
-        updateAll();
         requestResize();
       }, 200);
     };
@@ -1563,7 +2210,6 @@
       setTimeout(() => {
         if (!isWebFullscreen()) enterWebFullscreen();
         restoring = false;
-        updateAll();
         requestResize();
       }, 200);
     };
@@ -1594,8 +2240,9 @@
         event.stopImmediatePropagation();
         exitWebFullscreen();
       } else {
-        setTimeout(updateAll, 80);
-        setTimeout(updateAll, 360);
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        enterWebFullscreen();
       }
       return;
     }
@@ -1606,8 +2253,7 @@
       exitNativeAndRestore();
     } else {
       stateBeforeNative = web ? 'wide' : 'normal';
-      setTimeout(updateAll, 120);
-      setTimeout(updateAll, 600);
+      scheduleFullscreenRefresh();
       setTimeout(() => {
         if (!isNativeFullscreen()) stateBeforeNative = null;
       }, 1500);
@@ -1730,6 +2376,7 @@
     }
     setTimeout(updateAll, 80);
     setTimeout(updateAll, 360);
+    setTimeout(updateAll, 700);
   }
 
   function onFullscreenChange() {
@@ -1790,6 +2437,11 @@
 
     document.addEventListener('click', onControlClick, true);
     document.addEventListener('click', onPlaylistOutsideClick, true);
+    document.addEventListener('pointerdown', notePreferenceGesture, true);
+    document.addEventListener('click', notePreferenceGesture, true);
+    document.addEventListener('keydown', notePreferenceGesture, true);
+    document.addEventListener('wheel', notePreferenceGesture, { capture: true, passive: true });
+    window.addEventListener('keydown', onGlobalKeydown, true);
     window.addEventListener('keydown', onPlaylistKeydown, true);
     window.addEventListener('mousedown', recordClickState, true);
     window.addEventListener('click', onSurfaceClick, true);
