@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小鹅通课程页布局重构
 // @namespace    https://github.com/StreetCornelia/xet-plus
-// @version      0.3.14
+// @version      0.3.15
 // @description  重构课程页：16:9 播放器、默认网页宽屏、播放参数记忆、多系列选集 tab、无刷新切课
 // @author       Dash
 // @match        https://*.pc.xiaoe-tech.com/p/t_pc/course_pc_detail/video/*
@@ -18,7 +18,7 @@
   'use strict';
 
   const STYLE_ID = 'xet-layout-style';
-  const STYLE_VERSION = '0.3.14';
+  const STYLE_VERSION = '0.3.15';
   const PREFS_KEY = 'xet-playback-prefs-v1';
   const CATALOG_API = '/xe.course.business_go.avoidlogin.e_course.resource_catalog_list.get/1.0.0';
   const SUB_CATALOG_API = '/xe.course.business_go.avoidlogin.e_course.sub.course.list/1.0.0';
@@ -1152,6 +1152,35 @@
     return rid && rid !== getCurrentResourceId() ? sectionUrl({ rid, type: 3 }) : '';
   }
 
+  function getNextCatalogVideoUrl() {
+    if (!catalogTree) return '';
+    const rid = getCurrentResourceId();
+    if (!rid) return '';
+
+    const sections = allCatalogSections();
+    const index = sections.findIndex((section) => section.rid === rid);
+    if (index < 0) return '';
+
+    const next = sections[index + 1];
+    if (!next || (next.type !== 3 && !/^v_/.test(next.rid))) return '';
+    return sectionUrl(next);
+  }
+
+  function nextVideoUrlFor(target) {
+    const direct = videoTargetToUrl(target);
+    if (direct) return direct;
+    if (!catalogTree) loadCatalog().catch(() => {});
+    return getNextCatalogVideoUrl();
+  }
+
+  function isContinuousPlayMode(playerVm) {
+    const mode =
+      Number(playerVm?.playModeType ?? playerVm?.playMode) ||
+      Number(readPlaybackPrefs().playmode) ||
+      0;
+    return !mode || mode === 3;
+  }
+
   function patchNativeNextNavigation() {
     const playerVm = document.querySelector('.video-content-header')?.__vue__;
     if (!playerVm) return;
@@ -1168,7 +1197,11 @@
       const original = originalJumpTargetUrl.get(funcTool);
       const patched = function (target, ...args) {
         try {
-          const url = videoTargetToUrl(target);
+          let url = videoTargetToUrl(target);
+          if (!url && isContinuousPlayMode(playerVm)) {
+            if (!catalogTree) loadCatalog().catch(() => {});
+            url = getNextCatalogVideoUrl();
+          }
           if (url) {
             switchLessonSeamlessly(url);
             return;
@@ -1192,6 +1225,10 @@
       const original = originalChangeNextVideoEvent.get(playerVm);
       const patched = async function (...args) {
         try {
+          if (!isContinuousPlayMode(this)) {
+            return original.apply(this, args);
+          }
+
           if (
             this.isPrdPackage &&
             !this.loopVideoForPackage?.next &&
@@ -1199,7 +1236,15 @@
           ) {
             await this.initLoop();
           }
-          const url = videoTargetToUrl(this.loopVideoForPackage?.next);
+
+          const nextTarget = this.loopVideoForPackage?.next;
+          let url = nextVideoUrlFor(nextTarget);
+          if (!url && !catalogTree) {
+            try {
+              await loadCatalog();
+            } catch (_) {}
+            url = getNextCatalogVideoUrl();
+          }
           if (url) {
             switchLessonSeamlessly(url);
             return;
