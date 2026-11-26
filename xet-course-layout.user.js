@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小鹅通课程页布局重构
 // @namespace    https://github.com/StreetCornelia/xet-plus
-// @version      0.3.15
+// @version      0.3.16
 // @description  重构课程页：16:9 播放器、默认网页宽屏、播放参数记忆、多系列选集 tab、无刷新切课
 // @author       Dash
 // @match        https://*.pc.xiaoe-tech.com/p/t_pc/course_pc_detail/video/*
@@ -18,7 +18,7 @@
   'use strict';
 
   const STYLE_ID = 'xet-layout-style';
-  const STYLE_VERSION = '0.3.15';
+  const STYLE_VERSION = '0.3.16';
   const PREFS_KEY = 'xet-playback-prefs-v1';
   const CATALOG_API = '/xe.course.business_go.avoidlogin.e_course.resource_catalog_list.get/1.0.0';
   const SUB_CATALOG_API = '/xe.course.business_go.avoidlogin.e_course.sub.course.list/1.0.0';
@@ -94,6 +94,11 @@
   let hoverCloseTimer = 0;
   let seamlessSwitching = false;
   let activeLessonPath = location.pathname;
+  let suppressCatalogNextUntil = 0;
+  let statusRefreshTimer = 0;
+  let statusRefreshBusy = false;
+  let lastStatusRefreshAt = 0;
+  const videoResourceIds = new WeakMap();
   const originalJumpTargetUrl = new WeakMap();
   const originalChangeNextVideoEvent = new WeakMap();
 
@@ -895,11 +900,13 @@
       watchedVideo.removeEventListener('loadstart', onVideoLoaded);
       watchedVideo.removeEventListener('emptied', onVideoLoaded);
       watchedVideo.removeEventListener('playing', onVideoPlaying);
+      watchedVideo.removeEventListener('ended', onVideoEnded);
       watchedVideo.removeEventListener('volumechange', onVolumeChange);
       watchedVideo.removeEventListener('ratechange', onRateChange);
     }
 
     watchedVideo = video;
+    videoResourceIds.set(video, getCurrentResourceId());
     startupUntil = Date.now() + 15000;
     startupRepairCount = 0;
     playRestoreDone = false;
@@ -907,6 +914,7 @@
     video.addEventListener('loadstart', onVideoLoaded);
     video.addEventListener('emptied', onVideoLoaded);
     video.addEventListener('playing', onVideoPlaying);
+    video.addEventListener('ended', onVideoEnded);
     video.addEventListener('volumechange', onVolumeChange);
     video.addEventListener('ratechange', onRateChange);
 
@@ -1091,6 +1099,7 @@
 
     const target = new URL(url, location.origin);
     if (target.href === location.href) return;
+    captureCurrentProgress();
     seamlessSwitching = true;
     closePlaylist();
     try {
@@ -1100,6 +1109,7 @@
       armApply();
       scheduleUpdate();
       requestResize();
+      schedulePostSwitchStatusRefresh();
     } catch (error) {
       console.warn('[xet] 无刷新切课失败，已回退到整页跳转。', error);
       location.assign(target.href);
@@ -1118,6 +1128,7 @@
       }
 
       const target = new URL(location.href);
+      captureCurrentProgress();
       seamlessSwitching = true;
       try {
         await refreshVideoPlayer(target, false);
@@ -1126,6 +1137,7 @@
         armApply();
         scheduleUpdate();
         requestResize();
+        schedulePostSwitchStatusRefresh();
       } catch (error) {
         console.warn('[xet] 浏览器前进/后退切课失败，已刷新页面。', error);
         location.reload();
@@ -1169,8 +1181,46 @@
   function nextVideoUrlFor(target) {
     const direct = videoTargetToUrl(target);
     if (direct) return direct;
+    if (Date.now() < suppressCatalogNextUntil) return '';
     if (!catalogTree) loadCatalog().catch(() => {});
     return getNextCatalogVideoUrl();
+  }
+
+  function isCatalogNextSuppressed() {
+    return Date.now() < suppressCatalogNextUntil;
+  }
+
+  function markEndedAdvanceGuard() {
+    if (getActiveVideo()?.ended) suppressCatalogNextUntil = Date.now() + 10000;
+  }
+
+  async function onVideoEnded(event) {
+    const video =
+      event?.currentTarget instanceof HTMLVideoElement ? event.currentTarget : getActiveVideo();
+    const rid = (video && videoResourceIds.get(video)) || getCurrentResourceId();
+    const playerVm = document.querySelector('.video-content-header')?.__vue__;
+    const continuous = isContinuousPlayMode(playerVm);
+    captureCurrentProgress(true, rid, video);
+    if (!continuous || seamlessSwitching || getCurrentResourceId() !== rid) return;
+
+    // Give the site's own completion report a moment before replacing the player.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    if (seamlessSwitching || getCurrentResourceId() !== rid) return;
+
+    let next = videoTargetToUrl(playerVm?.loopVideoForPackage?.next);
+    if (!next) {
+      if (!catalogTree) {
+        try {
+          await loadCatalog();
+        } catch (_) {}
+      }
+      if (seamlessSwitching || getCurrentResourceId() !== rid) return;
+      next = getNextCatalogVideoUrl();
+    }
+    if (!next || seamlessSwitching) return;
+
+    suppressCatalogNextUntil = Date.now() + 10000;
+    switchLessonSeamlessly(next);
   }
 
   function isContinuousPlayMode(playerVm) {
@@ -1178,7 +1228,7 @@
       Number(playerVm?.playModeType ?? playerVm?.playMode) ||
       Number(readPlaybackPrefs().playmode) ||
       0;
-    return !mode || mode === 3;
+    return mode === 3;
   }
 
   function patchNativeNextNavigation() {
@@ -1198,14 +1248,16 @@
       const patched = function (target, ...args) {
         try {
           let url = videoTargetToUrl(target);
-          if (!url && isContinuousPlayMode(playerVm)) {
+          if (!url && isContinuousPlayMode(playerVm) && !isCatalogNextSuppressed()) {
             if (!catalogTree) loadCatalog().catch(() => {});
             url = getNextCatalogVideoUrl();
           }
           if (url) {
+            markEndedAdvanceGuard();
             switchLessonSeamlessly(url);
             return;
           }
+          if (isContinuousPlayMode(playerVm) && isCatalogNextSuppressed()) return;
         } catch (_) {}
         return original.call(this, target, ...args);
       };
@@ -1239,16 +1291,18 @@
 
           const nextTarget = this.loopVideoForPackage?.next;
           let url = nextVideoUrlFor(nextTarget);
-          if (!url && !catalogTree) {
+          if (!url && !catalogTree && !isCatalogNextSuppressed()) {
             try {
               await loadCatalog();
             } catch (_) {}
             url = getNextCatalogVideoUrl();
           }
           if (url) {
+            markEndedAdvanceGuard();
             switchLessonSeamlessly(url);
             return;
           }
+          if (isCatalogNextSuppressed()) return;
         } catch (_) {}
         return original.apply(this, args);
       };
@@ -1586,14 +1640,18 @@
     return !!playlistCurrentChapterId && chapterId === playlistCurrentChapterId;
   }
 
-  function findCurrentChapterId(rid) {
-    if (!rid) return '';
+  function findCatalogChapter(rid) {
+    if (!rid) return null;
     for (const group of catalogTree || []) {
       for (const chapter of group.chapters || []) {
-        if ((chapter.sections || []).some((section) => section.rid === rid)) return chapter.id;
+        if ((chapter.sections || []).some((section) => section.rid === rid)) return chapter;
       }
     }
-    return '';
+    return null;
+  }
+
+  function findCurrentChapterId(rid) {
+    return findCatalogChapter(rid)?.id || '';
   }
 
   function setAllChapters(expanded) {
@@ -1785,13 +1843,17 @@
 
     if (catalogTree) {
       renderPlaylist();
+      refreshCurrentChapterStatus();
       return;
     }
 
     renderPlaylistMessage('正在加载课程目录…');
     loadCatalog()
       .then(() => {
-        if (playlistOpen) renderPlaylist();
+        if (playlistOpen) {
+          renderPlaylist();
+          refreshCurrentChapterStatus();
+        }
       })
       .catch((error) => {
         if (playlistOpen) renderPlaylistError(error);
@@ -1950,6 +2012,32 @@
     element.dataset.xetHighlighted = '1';
   }
 
+  function playlistRowMeta(section, activeRid) {
+    const parts = [];
+    if (section.rid === activeRid) parts.push('当前');
+    if (section.type === 3) {
+      if (section.duration) parts.push(formatDuration(section.duration));
+    } else if (section.type === 4) {
+      parts.push('直播');
+    }
+    if (section.status === 2) parts.push('已学完');
+    else if (section.progress > 0) parts.push(`${Math.round(section.progress)}%`);
+    if (section.unlock === 0 && !section.isTry) parts.push('未解锁');
+    return parts.join(' · ');
+  }
+
+  function decoratePlaylistRow(row, section, activeRid) {
+    const current = section.rid === activeRid;
+    row.classList.toggle('current', current);
+    if (current) row.setAttribute('aria-current', 'true');
+    else row.removeAttribute('aria-current');
+    row.classList.toggle('done', section.status === 2);
+    row.classList.toggle('locked', section.unlock === 0 && !section.isTry);
+
+    const meta = row.querySelector('.xet-pl-item-meta');
+    if (meta) meta.textContent = playlistRowMeta(section, activeRid);
+  }
+
   function createPlaylistRow(chapter, section, activeRid) {
     const row = document.createElement('button');
     row.type = 'button';
@@ -1959,33 +2047,163 @@
     row.dataset.search = String(section.title || '').toLowerCase();
     row.title = section.title;
 
-    if (section.rid === activeRid) {
-      row.classList.add('current');
-      row.setAttribute('aria-current', 'true');
-    }
-    if (section.status === 2) row.classList.add('done');
-    if (section.unlock === 0 && !section.isTry) row.classList.add('locked');
-
     const title = document.createElement('span');
     title.className = 'xet-pl-item-title';
     title.textContent = section.title;
 
     const meta = document.createElement('span');
     meta.className = 'xet-pl-item-meta';
-    const parts = [];
-    if (section.rid === activeRid) parts.push('当前');
-    if (section.type === 3) {
-      if (section.duration) parts.push(formatDuration(section.duration));
-    } else if (section.type === 4) {
-      parts.push('直播');
-    }
-    if (section.status === 2) parts.push('已学完');
-    else if (section.progress > 0) parts.push(`${section.progress}%`);
-    if (section.unlock === 0 && !section.isTry) parts.push('未解锁');
-    meta.textContent = parts.join(' · ');
 
     row.append(title, meta);
+    decoratePlaylistRow(row, section, activeRid);
     return row;
+  }
+
+  function getChapterCountInfo(chapter) {
+    const total = chapter.sections.length;
+    const done = chapter.sections.filter((section) => section.status === 2).length;
+    const learning = chapter.sections.filter(
+      (section) => section.status !== 2 && (section.status === 1 || section.progress > 0)
+    ).length;
+    const parts = [`${total} 节`];
+    if (done) parts.push(`已学完 ${done}`);
+    if (learning) parts.push(`学习中 ${learning}`);
+    return {
+      text: parts.join(' · '),
+      title: `共 ${total} 节，已学完 ${done} 节，学习中 ${learning} 节`
+    };
+  }
+
+  function setChapterCountElement(amount, chapter) {
+    if (!amount) return;
+    if (chapter.error) {
+      amount.textContent = '加载失败';
+      amount.removeAttribute('title');
+      return;
+    }
+    const info = getChapterCountInfo(chapter);
+    amount.textContent = info.text;
+    amount.title = info.title;
+  }
+
+  function updateChapterInPlaylist(chapter) {
+    if (!playlistPanel || !chapter) return;
+    const body = playlistPanel.querySelector('.xet-pl-body');
+    if (!body) return;
+
+    const chapterElements = [...body.querySelectorAll('.xet-pl-chapter')];
+    let chapterElement = chapter.id
+      ? chapterElements.find((element) => element.dataset.chapterId === chapter.id)
+      : null;
+
+    if (!chapterElement) {
+      const rids = new Set(chapter.sections.map((section) => section.rid));
+      chapterElement =
+        chapterElements.find((element) =>
+          [...element.querySelectorAll('.xet-pl-item')].some((row) => rids.has(row.dataset.rid))
+        ) || null;
+    }
+    if (!chapterElement) return;
+
+    setChapterCountElement(chapterElement.querySelector('.xet-pl-chapter-count'), chapter);
+    const activeRid = getCurrentResourceId();
+    for (const row of chapterElement.querySelectorAll('.xet-pl-item')) {
+      const section = chapter.sections.find((item) => item.rid === row.dataset.rid);
+      if (section) decoratePlaylistRow(row, section, activeRid);
+    }
+    applyPlaylistFilter();
+  }
+
+  function captureCurrentProgress(completed = false, ridOverride = '', videoOverride = null) {
+    if (!catalogTree || !isPlaybackPage()) return;
+    const rid = ridOverride || getCurrentResourceId();
+    const video = videoOverride || getActiveVideo();
+    if (!rid || !video) return;
+
+    const section = findCatalogSection(rid);
+    const chapter = findCatalogChapter(rid);
+    if (!section || !chapter) return;
+
+    const ended = completed || video.ended;
+    if (ended) {
+      section.status = 2;
+      section.progress = 100;
+    } else {
+      const duration = Number(video.duration);
+      if (Number.isFinite(duration) && duration > 0) {
+        const progress = Math.min(100, Math.max(0, Math.round((video.currentTime / duration) * 100)));
+        if (progress > 0) {
+          if (section.status !== 2) section.status = 1;
+          section.progress = Math.max(Number(section.progress) || 0, progress);
+        }
+      }
+    }
+    updateChapterInPlaylist(chapter);
+  }
+
+  async function refreshCurrentChapterStatus(force = false) {
+    if (!isPlaybackPage() || !catalogTree || statusRefreshBusy) return;
+    const now = Date.now();
+    if (!force && now - lastStatusRefreshAt < 25000) return;
+
+    const rid = getCurrentResourceId();
+    const chapter = findCatalogChapter(rid);
+    if (!chapter || !chapter.id) return;
+
+    statusRefreshBusy = true;
+    lastStatusRefreshAt = now;
+    try {
+      const list = await catalogRequest({ p_id: chapter.id });
+      if (!catalogTree) return;
+      const sections = list
+        .map(normalizeSection)
+        .filter((section) => section.rid && section.title);
+      if (!sections.length) return;
+
+      const previous = new Map((chapter.sections || []).map((section) => [section.rid, section]));
+      for (const section of sections) {
+        const old = previous.get(section.rid);
+        if (!old) continue;
+        if (old.status === 2) {
+          section.status = 2;
+          section.progress = 100;
+        } else if (section.status !== 2) {
+          section.progress = Math.max(Number(section.progress) || 0, Number(old.progress) || 0);
+        }
+      }
+      chapter.sections = sections;
+      chapter.error = false;
+      updateChapterInPlaylist(chapter);
+    } catch (_) {
+    } finally {
+      statusRefreshBusy = false;
+    }
+  }
+
+  function startStatusRefresh() {
+    if (statusRefreshTimer) return;
+    statusRefreshTimer = setInterval(() => {
+      if (!isPlaybackPage() || document.hidden) return;
+      captureCurrentProgress();
+      refreshCurrentChapterStatus();
+    }, 30000);
+  }
+
+  function stopStatusRefresh() {
+    if (statusRefreshTimer) {
+      clearInterval(statusRefreshTimer);
+      statusRefreshTimer = 0;
+    }
+    statusRefreshBusy = false;
+    lastStatusRefreshAt = 0;
+  }
+
+  function schedulePostSwitchStatusRefresh() {
+    setTimeout(() => {
+      if (!isPlaybackPage() || seamlessSwitching) return;
+      captureCurrentProgress();
+      refreshCurrentChapterStatus(true);
+    }, 1500);
   }
 
   function cleanSeriesLabel(label) {
@@ -2104,17 +2322,7 @@
           title.title = chapter.title;
           const amount = document.createElement('span');
           amount.className = 'xet-pl-chapter-count';
-          const doneCount = chapter.sections.filter((section) => section.status === 2).length;
-          const learningCount = chapter.sections.filter(
-            (section) => section.status !== 2 && (section.status === 1 || section.progress > 0)
-          ).length;
-          const countParts = [`${chapter.sections.length} 节`];
-          if (doneCount) countParts.push(`已学完 ${doneCount}`);
-          if (learningCount) countParts.push(`学习中 ${learningCount}`);
-          amount.textContent = chapter.error ? '加载失败' : countParts.join(' · ');
-          if (!chapter.error) {
-            amount.title = `共 ${chapter.sections.length} 节，已学完 ${doneCount} 节，学习中 ${learningCount} 节`;
-          }
+          setChapterCountElement(amount, chapter);
           const chevron = document.createElement('span');
           chevron.className = 'xet-pl-chevron';
           chevron.textContent = '▾';
@@ -2539,6 +2747,7 @@
     if (playlistOpen) ensurePlaylistPanel();
     scheduleCatalogPrefetch();
     scheduleInitialWideMode();
+    startStatusRefresh();
   }
 
   function scheduleUpdate() {
@@ -2582,6 +2791,7 @@
       wideRetryTimer = 0;
       wideRetryCount = 0;
       initialWideDone = false;
+      stopStatusRefresh();
       document.documentElement.classList.remove('xet-rebuild', 'xet-fs-wide', 'xet-native-full');
       if (document.body) {
         document.body.classList.remove('xet-rebuild', 'xet-fs-wide', 'xet-native-full');
@@ -2604,6 +2814,7 @@
         watchedVideo.removeEventListener('emptied', onVideoLoaded);
         watchedVideo.removeEventListener('volumechange', onVolumeChange);
         watchedVideo.removeEventListener('ratechange', onRateChange);
+        watchedVideo.removeEventListener('ended', onVideoEnded);
         watchedVideo = null;
       }
       watchedTitle = null;
