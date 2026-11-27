@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小鹅通课程页布局重构
 // @namespace    https://github.com/StreetCornelia/xet-plus
-// @version      0.3.17
+// @version      0.3.18
 // @description  重构课程页：16:9 播放器、默认网页宽屏、播放参数记忆、多系列选集 tab、无刷新切课
 // @author       Dash
 // @match        https://*.pc.xiaoe-tech.com/p/t_pc/course_pc_detail/video/*
@@ -81,7 +81,7 @@
 
   const Config = {
     STYLE_ID: 'xet-layout-style',
-    STYLE_VERSION: '0.3.17',
+    STYLE_VERSION: '0.3.18',
     PREFS_KEY: 'xet-playback-prefs-v1',
     CATALOG_API: '/xe.course.business_go.avoidlogin.e_course.resource_catalog_list.get/1.0.0',
     SUB_CATALOG_API: '/xe.course.business_go.avoidlogin.e_course.sub.course.list/1.0.0',
@@ -2760,6 +2760,8 @@
       this.switching = false;
       this.activeLessonPath = location.pathname;
       this.suppressUntil = 0;
+      this.completionPromptTimer = 0;
+      this.hiddenPrompt = null;
       this.originalJumpTargetUrl = new WeakMap();
       this.originalChangeNextVideoEvent = new WeakMap();
       this.onRefresh = null;
@@ -2778,6 +2780,8 @@
 
       const target = new URL(url, location.origin);
       if (target.href === location.href) return;
+      this.startCompletionPromptWatch();
+      this.cancelCompletionPrompt();
       this.status.capture();
       this.switching = true;
       this.playlist.closePlaylist();
@@ -2883,6 +2887,8 @@
       this.status.capture(true, rid, video);
       if (!continuous || this.switching || this.ctx.getCurrentResourceId() !== rid) return;
 
+      this.startCompletionPromptWatch();
+
       // Give the site's own completion report a moment before replacing the player.
       await new Promise((resolve) => setTimeout(resolve, 600));
       if (this.switching || this.ctx.getCurrentResourceId() !== rid) return;
@@ -2897,10 +2903,111 @@
         if (this.switching || this.ctx.getCurrentResourceId() !== rid) return;
         next = this.getNextCatalogVideoUrl();
       }
-      if (!next || this.switching) return;
+      if (!next || this.switching) {
+        if (!this.switching) this.restoreCompletionPrompt();
+        return;
+      }
 
       this.suppressUntil = Date.now() + 10000;
       this.switchLesson(next);
+    }
+
+    findCompletionPrompt() {
+      const result = document.evaluate(
+        "//*[normalize-space(string(.))='暂不跳转']",
+        document,
+        null,
+        XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+        null
+      );
+
+      for (let index = 0; index < result.snapshotLength; index += 1) {
+        const skip = result.snapshotItem(index);
+        let dialog = skip;
+        while (dialog && dialog !== document.body) {
+          const text = dialog.textContent || '';
+          if (text.includes('你已学完当前任务') || text.includes('后将自动跳转下一')) {
+            return { dialog, skip };
+          }
+          dialog = dialog.parentElement;
+        }
+      }
+      return null;
+    }
+
+    hideCompletionPrompt() {
+      const found = this.findCompletionPrompt();
+      if (!found) return false;
+
+      const { dialog, skip } = found;
+      let root = dialog;
+      let node = dialog.parentElement;
+      while (node && node !== document.body) {
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        if (
+          rect.width >= window.innerWidth * 0.9 &&
+          rect.height >= window.innerHeight * 0.9 &&
+          (style.position === 'fixed' || style.position === 'absolute')
+        ) {
+          root = node;
+          break;
+        }
+        node = node.parentElement;
+      }
+
+      const siblingMask =
+        dialog.parentElement &&
+        [...dialog.parentElement.children].find((sibling) => {
+          if (sibling === dialog) return false;
+          if (!/mask|overlay|backdrop/i.test(String(sibling.className || ''))) return false;
+          const rect = sibling.getBoundingClientRect();
+          return rect.width >= window.innerWidth * 0.9 && rect.height >= window.innerHeight * 0.9;
+        });
+
+      const elements = [...new Set([root, dialog, siblingMask].filter(Boolean))];
+      for (const element of elements) {
+        element.style.setProperty('display', 'none', 'important');
+      }
+      this.hiddenPrompt = { elements, skip };
+      return true;
+    }
+
+    startCompletionPromptWatch() {
+      clearInterval(this.completionPromptTimer);
+      const deadline = Date.now() + 5000;
+      const tick = () => {
+        if (!this.ctx.isPlaybackPage() || Date.now() > deadline) {
+          clearInterval(this.completionPromptTimer);
+          this.completionPromptTimer = 0;
+          return;
+        }
+        this.hideCompletionPrompt();
+      };
+      tick();
+      this.completionPromptTimer = setInterval(tick, 60);
+    }
+
+    cancelCompletionPrompt() {
+      const found = this.findCompletionPrompt();
+      if (!found) return;
+      try {
+        found.skip.click();
+      } catch (_) {}
+    }
+
+    restoreCompletionPrompt() {
+      clearInterval(this.completionPromptTimer);
+      this.completionPromptTimer = 0;
+      if (!this.hiddenPrompt) return;
+      for (const element of this.hiddenPrompt.elements) {
+        if (element?.isConnected) element.style.removeProperty('display');
+      }
+      this.hiddenPrompt = null;
+    }
+
+    stop() {
+      this.restoreCompletionPrompt();
     }
 
     patchNativeNextNavigation() {
@@ -3503,6 +3610,7 @@
       this.catalogPrefetchDone = false;
       this.fullscreen.stop();
       this.status.stop();
+      this.navigator.stop();
       this.chrome.remove();
       this.prefs.stop();
       if (this.docTitleObserver) this.docTitleObserver.disconnect();
